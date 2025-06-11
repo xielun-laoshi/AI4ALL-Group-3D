@@ -1,2 +1,2 @@
 # AI4ALL-Group-3D   
-6/9 - Uploaded original datasets
+6/9 - Uploaded original datasets, did some simlpe data analysis
