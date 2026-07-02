@@ -52,7 +52,15 @@ class ModelConfig:
     backbone: str = "roberta-base"   # deberta-v3 NaNs on transformers>=~4.47 (use <4.47 for it)
     max_length: int = 512
     dropout: float = 0.1
-    use_pairwise_head: bool = True
+    # Run-2 ablation (2026-07, 3 seeds, paired bootstrap on ood_corpus): the
+    # unmasked pairwise head measured net-NEGATIVE for transfer (removing it
+    # +0.003, CI excl. 0) -> default off. The loss is now masked to same-source
+    # pairs; re-test deliberately before re-enabling.
+    use_pairwise_head: bool = False
+    # Source offset also measured negative under SINGLE-gold training (removing
+    # it +0.008, CI excl. 0) -- but it exists for MULTI-gold scales, the next
+    # default experiment (LOCO). Keep on for multi-gold; set false for
+    # single-gold cross-corpus runs.
     use_source_offset: bool = True
     peft: bool = False
 

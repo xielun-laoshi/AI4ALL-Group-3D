@@ -100,6 +100,18 @@ def test_read_clear_aliases_drifted_columns(tmp_path):
     assert df["BT Easiness"].iloc[0] == -0.5
 
 
+def test_pairwise_loss_masks_cross_source_pairs():
+    import torch
+    from readability.training import _pairwise_loss
+    # Within each source the ordering is CORRECT; every wrong ordering is a
+    # cross-source pair. Masked loss must be 0; unmasked must be positive.
+    scores = torch.tensor([1.0, 2.0, -5.0, -4.0])
+    targets = torch.tensor([0.1, 0.9, 0.2, 0.8])
+    sources = torch.tensor([0, 0, 1, 1])
+    assert float(_pairwise_loss(scores, targets, sources)) == 0.0
+    assert float(_pairwise_loss(scores, targets, None)) > 0.0
+
+
 def test_window_text_two_chunk_short_tail_does_not_crash():
     from readability.data import window_text
     # 180-word para + 20-word tail para -> 2 chunks, tail < min_words.

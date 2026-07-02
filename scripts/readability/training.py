@@ -49,9 +49,15 @@ class _Rows(Dataset):
         return self.text[i], self.y[i], self.src[i], self.w[i], self.ids[i]
 
 
-def _pairwise_loss(scores: torch.Tensor, targets: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
-    """Margin ranking loss over all ordered pairs in the batch where the targets
-    differ -- teaches correct *ordering*, which transfers across corpora."""
+def _pairwise_loss(scores: torch.Tensor, targets: torch.Tensor,
+                   sources: torch.Tensor | None = None, margin: float = 0.0) -> torch.Tensor:
+    """Margin ranking loss over ordered in-batch pairs where the targets differ --
+    teaches correct *ordering*, which transfers across corpora.
+
+    Pairs are restricted to the SAME source when ``sources`` is given: percentile
+    targets from different corpora aren't on a comparable ruler (0.5 in CEFR is
+    not 0.5 in CLEAR), so cross-source pairs inject scale-mismatch noise -- the
+    run-2 ablation measured the unmasked head as net-negative for transfer."""
     n = scores.shape[0]
     if n < 2:
         return scores.new_zeros(())
@@ -59,6 +65,8 @@ def _pairwise_loss(scores: torch.Tensor, targets: torch.Tensor, margin: float = 
     ti, tj = targets.unsqueeze(0), targets.unsqueeze(1)
     sign = torch.sign(ti - tj)
     mask = sign != 0
+    if sources is not None:
+        mask = mask & (sources.unsqueeze(0) == sources.unsqueeze(1))
     if mask.sum() == 0:
         return scores.new_zeros(())
     diff = (si - sj)
@@ -147,7 +155,7 @@ class Trainer:
                 with self._autocast():
                     pred = self.model(enc["input_ids"], enc["attention_mask"], src)
                     point = (w * (pred - y) ** 2).mean() * tc.pointwise_weight
-                    pair = _pairwise_loss(pred, y) * tc.pairwise_weight if self.cfg.model.use_pairwise_head else 0.0
+                    pair = _pairwise_loss(pred, y, src) * tc.pairwise_weight if self.cfg.model.use_pairwise_head else 0.0
                     loss = point + pair
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
