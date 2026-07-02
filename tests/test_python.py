@@ -134,6 +134,21 @@ def test_window_text_short_tail_merge_preserves_all_chunks():
     assert sum(1 for c in out if "bravo" in c) == 1      # no duplication
 
 
+def test_onestop_decomposition_within_vs_across():
+    from analyze_transfer import onestop_decomposition
+    # artA: levels ordered correctly by pred; artB: levels INVERTED.
+    rows = []
+    for art, flip in (("artA", False), ("artB", True)):
+        for lvl in (0, 1, 2):
+            pred = (2 - lvl if flip else lvl) * 0.3 + 0.1
+            rows.append({"id": f"onestop:{art}:{lvl}:0", "corpus": "onestop",
+                         "native_label": float(lvl), "pred": pred})
+    out = onestop_decomposition(pd.DataFrame(rows))
+    assert out["n_articles"] == 2
+    assert out["n_within_pairs"] == 6                  # 3 level-pairs per article
+    assert abs(out["within_article_acc"] - 0.5) < 1e-9  # one article right, one inverted
+
+
 def test_load_cefr_maps_levels(tmp_path):
     from readability.data import load_cefr
     csv = tmp_path / "cefr.csv"
