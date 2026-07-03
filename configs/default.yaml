@@ -27,7 +27,13 @@ model:
   backbone: roberta-base     # deberta-v3 NaNs on transformers>=~4.47; use transformers<4.47 for it
   max_length: 512
   dropout: 0.1
-  use_pairwise_head: true
+  # Run-2 ablation verdicts (3 seeds, paired bootstrap on ood_corpus, 2026-07):
+  #   pseudo-labeling  : null (delta -0.001, p=0.77)  | conf-weighting: tiny help (+0.002*)
+  #   pairwise head    : hurt (-0.003*) -> off; loss now masked to same-source pairs
+  #   source offset    : hurt under single-gold (-0.008*) but designed for multi-gold
+  #                      (LOCO) -> keep true here, set false for single-gold runs
+  #   two_stage        : n.s.
+  use_pairwise_head: false
   use_source_offset: true
   peft: false
 

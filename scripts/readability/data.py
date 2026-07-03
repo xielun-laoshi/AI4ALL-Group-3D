@@ -134,7 +134,12 @@ def window_text(text: str, *, target_words: int = 180, max_words: int = 320,
     if buf:
         chunks.append(" ".join(buf))
     if len(chunks) >= 2 and len(chunks[-1].split()) < min_words:
-        chunks[-2] = chunks[-2] + " " + chunks.pop()     # absorb a short tail
+        # Pop FIRST, then merge. The one-liner `chunks[-2] = ... + chunks.pop()`
+        # evaluates the RHS (shrinking the list) before resolving the assignment
+        # target: IndexError on 2-chunk docs, and on >=3 chunks it assigned to the
+        # wrong slot (losing one chunk and duplicating another).
+        tail = chunks.pop()
+        chunks[-1] = chunks[-1] + " " + tail             # absorb a short tail
     return chunks
 
 

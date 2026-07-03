@@ -100,6 +100,55 @@ def test_read_clear_aliases_drifted_columns(tmp_path):
     assert df["BT Easiness"].iloc[0] == -0.5
 
 
+def test_pairwise_loss_masks_cross_source_pairs():
+    import torch
+    from readability.training import _pairwise_loss
+    # Within each source the ordering is CORRECT; every wrong ordering is a
+    # cross-source pair. Masked loss must be 0; unmasked must be positive.
+    scores = torch.tensor([1.0, 2.0, -5.0, -4.0])
+    targets = torch.tensor([0.1, 0.9, 0.2, 0.8])
+    sources = torch.tensor([0, 0, 1, 1])
+    assert float(_pairwise_loss(scores, targets, sources)) == 0.0
+    assert float(_pairwise_loss(scores, targets, None)) > 0.0
+
+
+def test_window_text_two_chunk_short_tail_does_not_crash():
+    from readability.data import window_text
+    # 180-word para + 20-word tail para -> 2 chunks, tail < min_words.
+    # The old one-liner merge popped before resolving chunks[-2] -> IndexError.
+    doc = ("alpha " * 180).strip() + "\n\n" + ("tail " * 20).strip()
+    out = window_text(doc)
+    assert len(out) == 1
+    assert "alpha" in out[0] and "tail" in out[0]        # merged, nothing lost
+
+
+def test_window_text_short_tail_merge_preserves_all_chunks():
+    from readability.data import window_text
+    # 3 paras -> 3 chunks with a short tail. The old merge silently LOST the
+    # first chunk and duplicated the second; the fix merges tail into the last.
+    doc = ("alpha " * 180).strip() + "\n\n" + ("bravo " * 180).strip() + "\n\n" + ("tail " * 20).strip()
+    out = window_text(doc)
+    assert len(out) == 2
+    assert any("alpha" in c for c in out)                # first chunk survives
+    assert "tail" in out[-1] and "bravo" in out[-1]      # tail merged into last
+    assert sum(1 for c in out if "bravo" in c) == 1      # no duplication
+
+
+def test_onestop_decomposition_within_vs_across():
+    from analyze_transfer import onestop_decomposition
+    # artA: levels ordered correctly by pred; artB: levels INVERTED.
+    rows = []
+    for art, flip in (("artA", False), ("artB", True)):
+        for lvl in (0, 1, 2):
+            pred = (2 - lvl if flip else lvl) * 0.3 + 0.1
+            rows.append({"id": f"onestop:{art}:{lvl}:0", "corpus": "onestop",
+                         "native_label": float(lvl), "pred": pred})
+    out = onestop_decomposition(pd.DataFrame(rows))
+    assert out["n_articles"] == 2
+    assert out["n_within_pairs"] == 6                  # 3 level-pairs per article
+    assert abs(out["within_article_acc"] - 0.5) < 1e-9  # one article right, one inverted
+
+
 def test_load_cefr_maps_levels(tmp_path):
     from readability.data import load_cefr
     csv = tmp_path / "cefr.csv"
