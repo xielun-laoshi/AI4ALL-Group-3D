@@ -86,15 +86,28 @@ def onestop_decomposition(df: pd.DataFrame) -> dict[str, float]:
 
 def calibration_probe(df: pd.DataFrame, target_col: str, *, k: int = 50,
                       seed: int = 42) -> pd.DataFrame:
-    """Per held-out corpus: fit isotonic pred->target on k labels, evaluate
-    in-scale error on the remainder. The few-label adaptation cost of deployment."""
+    """Per corpus: fit isotonic pred->target on k labels, evaluate in-scale error
+    on the remainder. The few-label adaptation cost of deployment.
+
+    Groups by CORPUS over all predicted rows, NOT by split: the on-disk table is
+    rebuilt per LOCO fold, so analyzing fold-A predictions against a fold-B table
+    leaves the held-out rows' split labels stale ('train'), and a split filter
+    silently empties the probe (the bug hit on 2026-07-03). Staleness is warned
+    about instead; in-gold corpora just show a ~0 offset."""
     from sklearn.isotonic import IsotonicRegression
 
     rows = []
     rng = np.random.default_rng(seed)
-    for corpus, g in df[df["split"].isin(["ood_corpus", "ood_format"])].groupby("corpus"):
+    stale = df[df["split"] == "train"]
+    if len(stale):
+        log.warning("predictions exist for %d train-split rows (%s) -- the on-disk "
+                    "table likely doesn't match the run that produced these "
+                    "predictions; split labels may be stale",
+                    len(stale), sorted(stale["corpus"].unique()))
+    for corpus, g in df.groupby("corpus"):
         g = g.dropna(subset=[target_col, "pred"])
         if len(g) < k * 2:
+            log.info("calibration: skipping %s (%d rows < %d)", corpus, len(g), 2 * k)
             continue
         idx = rng.permutation(len(g))
         fit, rest = g.iloc[idx[:k]], g.iloc[idx[k:]]
@@ -102,13 +115,29 @@ def calibration_probe(df: pd.DataFrame, target_col: str, *, k: int = 50,
         iso.fit(fit["pred"], fit[target_col])
         calibrated = iso.predict(rest["pred"])
         rows.append({
-            "corpus": corpus, "k_labels": k, "n_eval": len(rest),
+            "corpus": corpus, "splits": "+".join(sorted(g["split"].astype(str).unique())),
+            "k_labels": k, "n_eval": len(rest),
             "rmse_before": rmse(rest[target_col], rest["pred"]),
             "rmse_after": rmse(rest[target_col], calibrated),
             "signed_before": mean_signed_error(rest[target_col], rest["pred"]),
             "signed_after": mean_signed_error(rest[target_col], calibrated),
         })
     return pd.DataFrame(rows)
+
+
+SCALE_FREE_COLS = ["corpus", "split", "spearman", "kendall", "pairwise_acc", "rank_rmse", "n"]
+
+
+def formula_baseline(table: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    """Score the free formula proxy (difficulty_proxy: sentence length + word
+    length) as if it were a model, per corpus. This is the OOD formula floor,
+    measured on each held-out corpus ITSELF -- the number a learned model must
+    beat there (the CLEAR-measured floor doesn't transfer automatically)."""
+    from readability.external import difficulty_proxy
+
+    fb = table.dropna(subset=[target_col]).copy()
+    fb["pred"] = fb["text"].astype(str).map(difficulty_proxy)
+    return fb
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,14 +148,37 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--table", default=None)
     ap.add_argument("--target", default="harmonized_difficulty")
     ap.add_argument("--calib-k", type=int, default=50)
+    ap.add_argument("--formula-baseline", action="store_true",
+                    help="also score the free formula proxy per corpus (no model needed)")
     args = ap.parse_args(argv)
+
+    from pathlib import Path
 
     cfg = load_config(args.config)
     table = read_table(args.table or cfg.data.unified_table)
-    preds = pd.read_csv(args.predictions)
-    df = table.merge(preds[["id", "pred"]], on="id", how="inner")
+
+    if not Path(args.predictions).exists():
+        if not args.formula_baseline:
+            raise SystemExit(f"{args.predictions} not found "
+                             f"(pass --formula-baseline to run without model predictions)")
+        df = pd.DataFrame()
+    else:
+        preds = pd.read_csv(args.predictions)
+        df = table.merge(preds[["id", "pred"]], on="id", how="inner")
+        if df.empty:
+            raise SystemExit("no id overlap between predictions and the table")
+
+    if args.formula_baseline:
+        fb = formula_baseline(table, args.target)
+        print("\n=== FORMULA floor per corpus (free proxy; rank metrics only) ===")
+        print(per_corpus_table(fb, args.target)[SCALE_FREE_COLS].to_string(index=False))
+        fdeco = onestop_decomposition(fb)
+        if fdeco:
+            print(f"  formula on OneStop: within-article acc {fdeco['within_article_acc']:.3f}"
+                  f" | across-article acc {fdeco['across_article_acc']:.3f}")
+
     if df.empty:
-        raise SystemExit("no id overlap between predictions and the table")
+        return 0
 
     print("\n=== Per-corpus metrics (held-out rows) ===")
     print(per_corpus_table(df, args.target).to_string(index=False))
