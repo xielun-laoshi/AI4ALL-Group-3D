@@ -62,6 +62,12 @@ class ModelConfig:
     # default experiment (LOCO). Keep on for multi-gold; set false for
     # single-gold cross-corpus runs.
     use_source_offset: bool = True
+    # Concat the standardized formula proxy to the pooled representation before
+    # the head. Motivated by the per-corpus formula floors (2026-07-03): the
+    # proxy alone scored 0.79 on CEFR (above every model) and 0.97 within-article
+    # on OneStop -- complementary signal the encoder misses. Off by default until
+    # the LOCO+hybrid run measures it.
+    use_formula_feature: bool = False
     peft: bool = False
 
 

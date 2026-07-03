@@ -128,6 +128,17 @@ def calibration_probe(df: pd.DataFrame, target_col: str, *, k: int = 50,
 SCALE_FREE_COLS = ["corpus", "split", "spearman", "kendall", "pairwise_acc", "rank_rmse", "n"]
 
 
+def rank_blend(model_scores, formula_scores, w: float = 0.5) -> np.ndarray:
+    """Zero-training hybrid: blend the percentile ranks of the model's scores and
+    the formula proxy (w = model weight). Ranks are computed over the scored pool,
+    which mirrors deployment (grading a collection). Motivated by complementary
+    strengths: model wins on CLEAR + across-article; proxy wins on CEFR +
+    within-article (0.97)."""
+    rm = pd.Series(np.asarray(model_scores, float)).rank(pct=True)
+    rf = pd.Series(np.asarray(formula_scores, float)).rank(pct=True)
+    return (w * rm + (1.0 - w) * rf).to_numpy()
+
+
 def formula_baseline(table: pd.DataFrame, target_col: str) -> pd.DataFrame:
     """Score the free formula proxy (difficulty_proxy: sentence length + word
     length) as if it were a model, per corpus. This is the OOD formula floor,
@@ -150,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--calib-k", type=int, default=50)
     ap.add_argument("--formula-baseline", action="store_true",
                     help="also score the free formula proxy per corpus (no model needed)")
+    ap.add_argument("--hybrid", action="store_true",
+                    help="score the zero-training rank-ensemble of model + formula proxy")
+    ap.add_argument("--hybrid-weight", type=float, default=0.5,
+                    help="model weight w in the blend (1-w goes to the proxy)")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -190,6 +205,20 @@ def main(argv: list[str] | None = None) -> int:
               f"  (n_pairs={deco['n_within_pairs']}) <- construct CLEAR never taught")
         print(f"  across-article ordering acc : {deco['across_article_acc']:.3f}"
               f"  (n_articles={deco['n_articles']})  <- construct the model learned")
+
+    if args.hybrid:
+        from readability.external import difficulty_proxy
+
+        hy = df.copy()
+        proxy = hy["text"].astype(str).map(difficulty_proxy)
+        hy["pred"] = rank_blend(hy["pred"], proxy, w=args.hybrid_weight)
+        print(f"\n=== HYBRID rank-ensemble (w_model={args.hybrid_weight:.2f}; "
+              f"ranks over the scored pool) ===")
+        print(per_corpus_table(hy, args.target)[SCALE_FREE_COLS].to_string(index=False))
+        hdeco = onestop_decomposition(hy)
+        if hdeco:
+            print(f"  hybrid on OneStop: within-article acc {hdeco['within_article_acc']:.3f}"
+                  f" | across-article acc {hdeco['across_article_acc']:.3f}")
 
     calib = calibration_probe(df, args.target, k=args.calib_k)
     if len(calib):

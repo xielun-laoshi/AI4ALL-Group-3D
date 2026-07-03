@@ -51,12 +51,18 @@ class Embedder:
 # --------------------------------------------------------------------------- #
 class DifficultyRegressor(nn.Module):
     def __init__(self, backbone: str = "roberta-base", n_sources: int = 1,
-                 dropout: float = 0.1, use_source_offset: bool = True) -> None:
+                 dropout: float = 0.1, use_source_offset: bool = True,
+                 n_extra_feats: int = 0) -> None:
         super().__init__()
         self.encoder = AutoModel.from_pretrained(backbone)
         hidden = self.encoder.config.hidden_size
         self.dropout = nn.Dropout(dropout)
-        self.head = nn.Linear(hidden, 1)
+        # Optional hand-crafted features (e.g. the standardized formula proxy)
+        # concatenated to the pooled representation before the head. Motivated by
+        # the per-corpus formula floors: the proxy alone scored 0.79 on CEFR and
+        # 0.97 within-article on OneStop -- signal complementary to the encoder's.
+        self.n_extra_feats = n_extra_feats
+        self.head = nn.Linear(hidden + n_extra_feats, 1)
         self.use_source_offset = use_source_offset
         if use_source_offset:
             self.source_offset = nn.Embedding(max(n_sources, 1), 1)
@@ -67,9 +73,14 @@ class DifficultyRegressor(nn.Module):
         m = mask.unsqueeze(-1).float()
         return (last_hidden * m).sum(1) / m.sum(1).clamp(min=1e-9)
 
-    def forward(self, input_ids, attention_mask, source_id=None) -> torch.Tensor:
+    def forward(self, input_ids, attention_mask, source_id=None,
+                extra_feats=None) -> torch.Tensor:
         out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         pooled = self._mean_pool(out.last_hidden_state, attention_mask)
+        if self.n_extra_feats:
+            assert extra_feats is not None and extra_feats.shape[-1] == self.n_extra_feats, \
+                "model built with n_extra_feats but none supplied"
+            pooled = torch.cat([pooled, extra_feats.float()], dim=-1)
         score = self.head(self.dropout(pooled)).squeeze(-1)
         if self.use_source_offset and source_id is not None:
             score = score + self.source_offset(source_id).squeeze(-1)

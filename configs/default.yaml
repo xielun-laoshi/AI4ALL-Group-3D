@@ -35,6 +35,10 @@ model:
   #   two_stage        : n.s.
   use_pairwise_head: false
   use_source_offset: true
+  # Formula/model hybrid (2026-07-03 floors: proxy 0.79 on CEFR > any model;
+  # 0.97 within-article on OneStop). Enable to concat the standardized proxy
+  # into the head; measure via the formula_feature ablation variant.
+  use_formula_feature: false
   peft: false
 
 train:

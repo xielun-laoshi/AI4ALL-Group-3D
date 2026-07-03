@@ -149,6 +149,17 @@ def test_onestop_decomposition_within_vs_across():
     assert abs(out["within_article_acc"] - 0.5) < 1e-9  # one article right, one inverted
 
 
+def test_rank_blend_ensemble_beats_both_singles():
+    from analyze_transfer import rank_blend
+    rng = np.random.default_rng(1)
+    t = rng.normal(size=600)
+    a = t + rng.normal(scale=1.0, size=600)   # two equally-noisy, independent views
+    b = t + rng.normal(scale=1.0, size=600)
+    h = rank_blend(a, b, w=0.5)
+    assert spearman(t, h) > spearman(t, a)
+    assert spearman(t, h) > spearman(t, b)    # classic ensemble gain
+
+
 def test_calibration_probe_survives_stale_split_labels():
     from analyze_transfer import calibration_probe
     rng = np.random.default_rng(0)
