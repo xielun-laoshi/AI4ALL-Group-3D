@@ -26,15 +26,14 @@ from readability.utils import artifacts_dir, get_logger
 log = get_logger("ablations")
 
 
-def _train_table(cfg, key: str) -> pd.DataFrame:
-    if key == "gold":
-        return read_table(cfg.data.unified_table)
-    p = cfg.pseudo.train_pool_table
-    if not Path(p).exists():
-        log.warning("train_pool %s missing -> falling back to gold; 'full' will equal "
-                    "'no_pseudo'. Run scripts/pseudo_label.py first for a valid pseudo ablation.", p)
-        return read_table(cfg.data.unified_table)
-    return read_table(p)
+def _train_table(cfg, key: str, force: str = "auto") -> pd.DataFrame:
+    from readability.data import select_train_table
+
+    df, path = select_train_table(cfg, force="gold" if key == "gold" else force)
+    if key == "train_pool" and path == str(cfg.data.unified_table) and force != "gold":
+        log.warning("no usable train_pool (missing or stale) -> variant trains on gold; "
+                    "'full' will equal 'no_pseudo'. Run scripts/pseudo_label.py to refresh.")
+    return df
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
     ap.add_argument("--variants", nargs="+", default=None, help="subset of ABLATIONS")
     ap.add_argument("--holdout-split", default="ood_corpus")
+    ap.add_argument("--train-table", choices=["auto", "gold"], default="auto",
+                    help="'gold' forces the unified table (ignore any train_pool)")
     args = ap.parse_args(argv)
 
     base = load_config(args.config)
@@ -58,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
         per_seed = []
         for seed in args.seeds:
             cfg = load_config(args.config, overrides=spec["overrides"] + [f"train.seed={seed}"])
-            train_df = _train_table(cfg, spec["train_table"])
+            train_df = _train_table(cfg, spec["train_table"], force=args.train_table)
             metrics, _ids, pr, tgt = run_variant(cfg, train_df, eval_df, holdout_split=args.holdout_split)
             rows.append({"variant": name, "seed": seed,
                          "spearman": metrics["spearman"], "rmse": metrics["rmse"], "n": metrics["n"]})

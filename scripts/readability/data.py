@@ -259,6 +259,36 @@ def _norm_text(s: object) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
 
+def select_train_table(cfg, *, force: str = "auto") -> tuple[pd.DataFrame, str]:
+    """Choose the student's training table: the pseudo-augmented train_pool if it
+    exists AND matches the current holdout configuration, else the unified gold
+    table. Returns (df, path_used).
+
+    Guard: the pool is built for ONE holdout configuration. After the unified
+    table is rebuilt with a different holdout (e.g. a LOCO fold), a leftover pool
+    silently runs the WRONG experiment -- its gold corpora no longer match."""
+    from .schema import read_table
+
+    gold_path = str(cfg.data.unified_table)
+    gold = read_table(gold_path)
+    if force == "gold":
+        return gold, gold_path
+    pool_path = str(cfg.pseudo.train_pool_table)
+    if not Path(pool_path).exists():
+        return gold, gold_path
+    pool = read_table(pool_path)
+    gold_corpora = set(gold.loc[gold["split"].isin(["train", "val"]), "corpus"])
+    pool_corpora = set(pool.loc[pool["split"].isin(["train", "val"])
+                                & (pool["is_pseudo"] != True), "corpus"])
+    if gold_corpora != pool_corpora:
+        log.warning("train_pool %s is STALE (its gold corpora %s != unified table's %s) -- "
+                    "built for a different holdout; using the gold table. Re-run "
+                    "scripts/pseudo_label.py to refresh it.",
+                    pool_path, sorted(pool_corpora), sorted(gold_corpora))
+        return gold, gold_path
+    return pool, pool_path
+
+
 def dedup_against(df: pd.DataFrame, reference: pd.DataFrame, *, key: str = "text") -> pd.DataFrame:
     """Drop rows of ``df`` whose normalized text exactly matches any reference text.
 

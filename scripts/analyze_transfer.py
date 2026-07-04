@@ -163,8 +163,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="also score the free formula proxy per corpus (no model needed)")
     ap.add_argument("--hybrid", action="store_true",
                     help="score the zero-training rank-ensemble of model + formula proxy")
-    ap.add_argument("--hybrid-weight", type=float, default=0.5,
-                    help="model weight w in the blend (1-w goes to the proxy)")
+    ap.add_argument("--hybrid-weight", type=float, nargs="+", default=[0.3, 0.5, 0.7],
+                    help="model weight(s) w in the blend (1-w goes to the proxy); "
+                         "multiple values sweep in one run")
     args = ap.parse_args(argv)
 
     from pathlib import Path
@@ -209,16 +210,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.hybrid:
         from readability.external import difficulty_proxy
 
-        hy = df.copy()
-        proxy = hy["text"].astype(str).map(difficulty_proxy)
-        hy["pred"] = rank_blend(hy["pred"], proxy, w=args.hybrid_weight)
-        print(f"\n=== HYBRID rank-ensemble (w_model={args.hybrid_weight:.2f}; "
-              f"ranks over the scored pool) ===")
-        print(per_corpus_table(hy, args.target)[SCALE_FREE_COLS].to_string(index=False))
-        hdeco = onestop_decomposition(hy)
-        if hdeco:
-            print(f"  hybrid on OneStop: within-article acc {hdeco['within_article_acc']:.3f}"
-                  f" | across-article acc {hdeco['across_article_acc']:.3f}")
+        proxy = df["text"].astype(str).map(difficulty_proxy)
+        model_pred = df["pred"].copy()
+        for w in args.hybrid_weight:
+            hy = df.copy()
+            hy["pred"] = rank_blend(model_pred, proxy, w=w)
+            print(f"\n=== HYBRID rank-ensemble (w_model={w:.2f}; ranks over the scored pool) ===")
+            print(per_corpus_table(hy, args.target)[SCALE_FREE_COLS].to_string(index=False))
+            hdeco = onestop_decomposition(hy)
+            if hdeco:
+                print(f"  hybrid on OneStop: within-article acc {hdeco['within_article_acc']:.3f}"
+                      f" | across-article acc {hdeco['across_article_acc']:.3f}")
 
     calib = calibration_probe(df, args.target, k=args.calib_k)
     if len(calib):
