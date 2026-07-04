@@ -86,15 +86,28 @@ def onestop_decomposition(df: pd.DataFrame) -> dict[str, float]:
 
 def calibration_probe(df: pd.DataFrame, target_col: str, *, k: int = 50,
                       seed: int = 42) -> pd.DataFrame:
-    """Per held-out corpus: fit isotonic pred->target on k labels, evaluate
-    in-scale error on the remainder. The few-label adaptation cost of deployment."""
+    """Per corpus: fit isotonic pred->target on k labels, evaluate in-scale error
+    on the remainder. The few-label adaptation cost of deployment.
+
+    Groups by CORPUS over all predicted rows, NOT by split: the on-disk table is
+    rebuilt per LOCO fold, so analyzing fold-A predictions against a fold-B table
+    leaves the held-out rows' split labels stale ('train'), and a split filter
+    silently empties the probe (the bug hit on 2026-07-03). Staleness is warned
+    about instead; in-gold corpora just show a ~0 offset."""
     from sklearn.isotonic import IsotonicRegression
 
     rows = []
     rng = np.random.default_rng(seed)
-    for corpus, g in df[df["split"].isin(["ood_corpus", "ood_format"])].groupby("corpus"):
+    stale = df[df["split"] == "train"]
+    if len(stale):
+        log.warning("predictions exist for %d train-split rows (%s) -- the on-disk "
+                    "table likely doesn't match the run that produced these "
+                    "predictions; split labels may be stale",
+                    len(stale), sorted(stale["corpus"].unique()))
+    for corpus, g in df.groupby("corpus"):
         g = g.dropna(subset=[target_col, "pred"])
         if len(g) < k * 2:
+            log.info("calibration: skipping %s (%d rows < %d)", corpus, len(g), 2 * k)
             continue
         idx = rng.permutation(len(g))
         fit, rest = g.iloc[idx[:k]], g.iloc[idx[k:]]
@@ -102,13 +115,40 @@ def calibration_probe(df: pd.DataFrame, target_col: str, *, k: int = 50,
         iso.fit(fit["pred"], fit[target_col])
         calibrated = iso.predict(rest["pred"])
         rows.append({
-            "corpus": corpus, "k_labels": k, "n_eval": len(rest),
+            "corpus": corpus, "splits": "+".join(sorted(g["split"].astype(str).unique())),
+            "k_labels": k, "n_eval": len(rest),
             "rmse_before": rmse(rest[target_col], rest["pred"]),
             "rmse_after": rmse(rest[target_col], calibrated),
             "signed_before": mean_signed_error(rest[target_col], rest["pred"]),
             "signed_after": mean_signed_error(rest[target_col], calibrated),
         })
     return pd.DataFrame(rows)
+
+
+SCALE_FREE_COLS = ["corpus", "split", "spearman", "kendall", "pairwise_acc", "rank_rmse", "n"]
+
+
+def rank_blend(model_scores, formula_scores, w: float = 0.5) -> np.ndarray:
+    """Zero-training hybrid: blend the percentile ranks of the model's scores and
+    the formula proxy (w = model weight). Ranks are computed over the scored pool,
+    which mirrors deployment (grading a collection). Motivated by complementary
+    strengths: model wins on CLEAR + across-article; proxy wins on CEFR +
+    within-article (0.97)."""
+    rm = pd.Series(np.asarray(model_scores, float)).rank(pct=True)
+    rf = pd.Series(np.asarray(formula_scores, float)).rank(pct=True)
+    return (w * rm + (1.0 - w) * rf).to_numpy()
+
+
+def formula_baseline(table: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    """Score the free formula proxy (difficulty_proxy: sentence length + word
+    length) as if it were a model, per corpus. This is the OOD formula floor,
+    measured on each held-out corpus ITSELF -- the number a learned model must
+    beat there (the CLEAR-measured floor doesn't transfer automatically)."""
+    from readability.external import difficulty_proxy
+
+    fb = table.dropna(subset=[target_col]).copy()
+    fb["pred"] = fb["text"].astype(str).map(difficulty_proxy)
+    return fb
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,14 +159,42 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--table", default=None)
     ap.add_argument("--target", default="harmonized_difficulty")
     ap.add_argument("--calib-k", type=int, default=50)
+    ap.add_argument("--formula-baseline", action="store_true",
+                    help="also score the free formula proxy per corpus (no model needed)")
+    ap.add_argument("--hybrid", action="store_true",
+                    help="score the zero-training rank-ensemble of model + formula proxy")
+    ap.add_argument("--hybrid-weight", type=float, nargs="+", default=[0.3, 0.5, 0.7],
+                    help="model weight(s) w in the blend (1-w goes to the proxy); "
+                         "multiple values sweep in one run")
     args = ap.parse_args(argv)
+
+    from pathlib import Path
 
     cfg = load_config(args.config)
     table = read_table(args.table or cfg.data.unified_table)
-    preds = pd.read_csv(args.predictions)
-    df = table.merge(preds[["id", "pred"]], on="id", how="inner")
+
+    if not Path(args.predictions).exists():
+        if not args.formula_baseline:
+            raise SystemExit(f"{args.predictions} not found "
+                             f"(pass --formula-baseline to run without model predictions)")
+        df = pd.DataFrame()
+    else:
+        preds = pd.read_csv(args.predictions)
+        df = table.merge(preds[["id", "pred"]], on="id", how="inner")
+        if df.empty:
+            raise SystemExit("no id overlap between predictions and the table")
+
+    if args.formula_baseline:
+        fb = formula_baseline(table, args.target)
+        print("\n=== FORMULA floor per corpus (free proxy; rank metrics only) ===")
+        print(per_corpus_table(fb, args.target)[SCALE_FREE_COLS].to_string(index=False))
+        fdeco = onestop_decomposition(fb)
+        if fdeco:
+            print(f"  formula on OneStop: within-article acc {fdeco['within_article_acc']:.3f}"
+                  f" | across-article acc {fdeco['across_article_acc']:.3f}")
+
     if df.empty:
-        raise SystemExit("no id overlap between predictions and the table")
+        return 0
 
     print("\n=== Per-corpus metrics (held-out rows) ===")
     print(per_corpus_table(df, args.target).to_string(index=False))
@@ -138,6 +206,21 @@ def main(argv: list[str] | None = None) -> int:
               f"  (n_pairs={deco['n_within_pairs']}) <- construct CLEAR never taught")
         print(f"  across-article ordering acc : {deco['across_article_acc']:.3f}"
               f"  (n_articles={deco['n_articles']})  <- construct the model learned")
+
+    if args.hybrid:
+        from readability.external import difficulty_proxy
+
+        proxy = df["text"].astype(str).map(difficulty_proxy)
+        model_pred = df["pred"].copy()
+        for w in args.hybrid_weight:
+            hy = df.copy()
+            hy["pred"] = rank_blend(model_pred, proxy, w=w)
+            print(f"\n=== HYBRID rank-ensemble (w_model={w:.2f}; ranks over the scored pool) ===")
+            print(per_corpus_table(hy, args.target)[SCALE_FREE_COLS].to_string(index=False))
+            hdeco = onestop_decomposition(hy)
+            if hdeco:
+                print(f"  hybrid on OneStop: within-article acc {hdeco['within_article_acc']:.3f}"
+                      f" | across-article acc {hdeco['across_article_acc']:.3f}")
 
     calib = calibration_probe(df, args.target, k=args.calib_k)
     if len(calib):

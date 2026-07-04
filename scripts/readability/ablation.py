@@ -30,6 +30,10 @@ ABLATIONS: dict[str, dict] = {
     # additive variant: two-stage pretrain->finetune. A NEGATIVE delta vs full
     # (single-pass) here means two-stage helped -> consider making it the default.
     "two_stage":        {"overrides": ["train.two_stage=true"], "train_table": "train_pool"},
+    # additive variant: formula/model hybrid -- standardized proxy concat into the
+    # head (per-corpus floors: proxy 0.79 on CEFR, 0.97 within-article OneStop).
+    # A NEGATIVE delta vs full means the feature helped -> consider defaulting on.
+    "formula_feature":  {"overrides": ["model.use_formula_feature=true"], "train_table": "train_pool"},
 }
 
 

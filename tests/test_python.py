@@ -149,6 +149,31 @@ def test_onestop_decomposition_within_vs_across():
     assert abs(out["within_article_acc"] - 0.5) < 1e-9  # one article right, one inverted
 
 
+def test_rank_blend_ensemble_beats_both_singles():
+    from analyze_transfer import rank_blend
+    rng = np.random.default_rng(1)
+    t = rng.normal(size=600)
+    a = t + rng.normal(scale=1.0, size=600)   # two equally-noisy, independent views
+    b = t + rng.normal(scale=1.0, size=600)
+    h = rank_blend(a, b, w=0.5)
+    assert spearman(t, h) > spearman(t, a)
+    assert spearman(t, h) > spearman(t, b)    # classic ensemble gain
+
+
+def test_calibration_probe_survives_stale_split_labels():
+    from analyze_transfer import calibration_probe
+    rng = np.random.default_rng(0)
+    t = rng.uniform(0, 1, 400)
+    # split says 'train' (stale table, the 2026-07-03 LOCO symptom) -- the probe
+    # must still run, grouped by corpus, and recover the constant -0.1 offset.
+    df = pd.DataFrame({"corpus": "onestop", "split": "train",
+                       "harmonized_difficulty": t, "pred": t - 0.1})
+    out = calibration_probe(df, "harmonized_difficulty", k=50)
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert abs(row["signed_after"]) < abs(row["signed_before"])
+
+
 def test_load_cefr_maps_levels(tmp_path):
     from readability.data import load_cefr
     csv = tmp_path / "cefr.csv"
