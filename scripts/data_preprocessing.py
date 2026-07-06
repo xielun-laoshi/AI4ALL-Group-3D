@@ -44,6 +44,9 @@ RAW_SOURCES = {
                 "dir": "onestop", "archive": "zip"},
     "cefr": {"url": "https://raw.githubusercontent.com/AMontgomerie/CEFR-English-Level-Predictor/main/data/cefr_leveled_texts.csv",
              "file": "cefr.csv"},
+    # built (not downloaded): title-join of wikimedia/wikipedia simple x en via
+    # `datasets` streaming -- see readability.external.build_wikipair_raw.
+    "wikipair": {"url": None, "file": "wikipair.csv", "builder": "wikipair"},
     "newsela": {"url": None, "dir": "newsela"},      # newsela.com/data (free, on request)
     "weebit": {"url": None, "dir": "weebit"},        # request from authors
     "gutenberg_poetry": {"url": None, "dir": "gutenberg_poetry"},  # Project Gutenberg
@@ -58,9 +61,9 @@ def local_raw_path(corpus: str) -> Path:
     return data_dir() / (spec["file"] if "file" in spec else spec["dir"])
 
 
-def ensure_raw(corpus: str, force: bool) -> Path:
-    """Make sure the raw data is present under data/, downloading if public+missing.
-    Returns a file path (single-file corpora) or a directory (archive corpora)."""
+def ensure_raw(corpus: str, force: bool, cfg=None) -> Path:
+    """Make sure the raw data is present under data/, downloading (or building)
+    if missing. Returns a file path (single-file corpora) or a directory."""
     spec = RAW_SOURCES.get(corpus)
     if spec is None:
         raise SystemExit(f"[{corpus}] unknown corpus (no source configured).")
@@ -69,6 +72,14 @@ def ensure_raw(corpus: str, force: bool) -> Path:
     if present and not force:
         log.info("[%s] using existing %s", corpus, dest)
         return dest
+    if spec.get("builder") == "wikipair":
+        from readability.external import build_wikipair_raw
+
+        n_pairs = cfg.data.wikipair_pairs if cfg is not None else 20000
+        log.info("[wikipair] building %d simple<->en pairs (streams wikimedia/wikipedia; "
+                 "scans ~%dk en articles)", n_pairs, int(n_pairs / 0.038 / 1000))
+        data_dir().mkdir(parents=True, exist_ok=True)
+        return Path(build_wikipair_raw(dest, n_pairs=n_pairs))
     if spec.get("url") is None:
         raise SystemExit(
             f"[{corpus}] no public download configured -- fetch it manually into "
@@ -112,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     # 1. download + 2. load into the unified schema
     frames = []
     for name in corpora:
-        raw = local_raw_path(name) if args.skip_download else ensure_raw(name, args.force_download)
+        raw = local_raw_path(name) if args.skip_download else ensure_raw(name, args.force_download, cfg)
         frames.append(load_corpus(name, raw))
     df = coerce(pd.concat(frames, ignore_index=True))
 

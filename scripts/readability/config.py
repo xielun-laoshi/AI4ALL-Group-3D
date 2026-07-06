@@ -33,6 +33,7 @@ class DataConfig:
     unified_table: str = "artifacts/corpus.csv"
     min_tokens: int = 3
     max_tokens: int = 600
+    wikipair_pairs: int = 20000   # simple<->en article pairs to build (corpus "wikipair")
 
 
 @dataclass

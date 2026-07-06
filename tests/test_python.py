@@ -149,6 +149,69 @@ def test_onestop_decomposition_within_vs_across():
     assert abs(out["within_article_acc"] - 0.5) < 1e-9  # one article right, one inverted
 
 
+# --- Wiki-pairs construct experiment ----------------------------------------- #
+def test_match_pairs_title_join():
+    from readability.external import match_pairs
+    long = lambda s: (s + " word") * 100
+    simple = [("Cat", long("simple cat")), ("Dog", long("simple dog")), ("Stub", "too short")]
+    en = [("Cat", long("complex cat")), ("Bird", long("no twin")), ("Stub", long("long enough")),
+          ("Dog", long("complex dog"))]
+    out = match_pairs(simple, en, n_pairs=10, min_words=50)
+    assert {p["title"] for p in out} == {"Cat", "Dog"}   # Stub too short, Bird unmatched
+
+
+def test_load_wikipair_requires_both_sides(tmp_path):
+    from readability.data import load_wikipair
+    body = ("word " * 120).strip()
+    csv = tmp_path / "wikipair.csv"
+    pd.DataFrame({"title": ["A", "B"],
+                  "simple_text": [body, ""],          # B has no simple side -> dropped
+                  "en_text": [body + " extra", body]}).to_csv(csv, index=False)
+    out = load_wikipair(csv)
+    assert set(out["corpus"]) == {"wikipair"}
+    parts = out["id"].str.split(":")
+    assert set(parts.str[1]) == {"0"}                   # only pair A survives
+    assert set(parts.str[2]) == {"simple", "en"}        # both sides present
+    assert set(out["native_label"]) == {0.0, 1.0}
+
+
+def test_pairing_group_ids_groups_pairs_only():
+    from readability.data import pairing_group_ids
+    df = pd.DataFrame({"id": ["wikipair:7:simple:0", "wikipair:7:en:0",
+                              "wikipair:8:en:0", "clear:1", "clear:2"],
+                       "corpus": ["wikipair"] * 3 + ["clear"] * 2})
+    g = pairing_group_ids(df)
+    assert g[0] == g[1]                                 # same article -> same group
+    assert g[2] not in (g[0], g[3], g[4])
+    assert len({g[3], g[4]} & {g[0], g[1], g[2]}) == 0 and g[3] != g[4]  # clear rows unique
+
+
+def test_harmonize_zeroes_pair_confidence_and_val_excludes_pairs():
+    from readability.data import harmonize, assign_splits
+    rows = [{"id": f"clear:{i}", "text": "t", "corpus": "clear", "native_label": float(i),
+             "format_type": "prose"} for i in range(20)]
+    rows += [{"id": f"wikipair:{i}:{lvl}:0", "text": "t", "corpus": "wikipair",
+              "native_label": lab, "format_type": "prose"}
+             for i in range(10) for lvl, lab in (("simple", 0.0), ("en", 1.0))]
+    df = harmonize(coerce(pd.DataFrame(rows)))
+    assert (df.loc[df.corpus == "wikipair", "mapping_confidence"] == 0).all()
+    assert (df.loc[df.corpus == "clear", "mapping_confidence"] == 1).all()
+    split = assign_splits(df, val_fraction=0.3, seed=0)
+    assert (split.loc[split.corpus == "wikipair", "split"] == "train").all()  # never val
+
+
+def test_group_shuffle_sampler_colocates_pair_members():
+    from readability.training import _GroupShuffleSampler
+    # groups: two 2-member articles + six singletons
+    groups = np.array([0, 0, 1, 1, 2, 3, 4, 5, 6, 7])
+    sampler = _GroupShuffleSampler(groups, seed=0)
+    order = list(iter(sampler))
+    assert sorted(order) == list(range(10))             # a permutation
+    for gid in (0, 1):                                  # pair members adjacent
+        pos = [order.index(i) for i in np.flatnonzero(groups == gid)]
+        assert abs(pos[0] - pos[1]) == 1
+
+
 def test_rank_blend_ensemble_beats_both_singles():
     from analyze_transfer import rank_blend
     rng = np.random.default_rng(1)

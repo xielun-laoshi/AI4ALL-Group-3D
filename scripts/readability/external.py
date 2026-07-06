@@ -47,6 +47,56 @@ def fetch_texts(source: str, limit: int) -> list[str]:
     return out
 
 
+def match_pairs(simple_docs, en_docs, *, n_pairs: int, min_words: int = 80):
+    """Title-join two (title, text) iterables into simple<->en article pairs.
+
+    Pure function (no `datasets` dependency) so the join logic is unit-testable;
+    build_wikipair_raw feeds it the streamed Wikipedia configs. Skips docs
+    shorter than min_words on either side (stubs/disambiguation)."""
+    simple_by_title: dict[str, str] = {}
+    for title, text in simple_docs:
+        t = (title or "").strip()
+        if t and text and len(text.split()) >= min_words:
+            simple_by_title.setdefault(t, text)
+    out = []
+    for title, text in en_docs:
+        if len(out) >= n_pairs:
+            break
+        t = (title or "").strip()
+        s = simple_by_title.get(t)
+        if s and text and len(text.split()) >= min_words:
+            out.append({"title": t, "simple_text": s, "en_text": text})
+            del simple_by_title[t]          # one pair per title
+    log.info("match_pairs: %d pairs (simple pool %d titles)", len(out), len(simple_by_title) + len(out))
+    return out
+
+
+def build_wikipair_raw(dest, *, n_pairs: int = 20000, max_simple: int = 200_000,
+                       max_en_scan: int = 2_000_000, min_words: int = 80):
+    """Stream wikimedia/wikipedia simple+en (verified configs) and write a raw
+    CSV of title-joined article pairs: title, simple_text, en_text.
+
+    ~3.8% of en articles have a simple twin, so finding n_pairs scans roughly
+    n_pairs/0.038 en articles; max_en_scan caps the walk."""
+    import pandas as pd
+    from datasets import load_dataset
+
+    def stream(config, limit):
+        ds = load_dataset("wikimedia/wikipedia", config, split="train", streaming=True)
+        for i, ex in enumerate(ds):
+            if i >= limit:
+                break
+            yield ex.get("title"), ex.get("text")
+
+    pairs = match_pairs(stream("20231101.simple", max_simple),
+                        stream("20231101.en", max_en_scan),
+                        n_pairs=n_pairs, min_words=min_words)
+    df = pd.DataFrame(pairs)
+    df.to_csv(dest, index=False)
+    log.info("wikipair raw: %d pairs -> %s", len(df), dest)
+    return dest
+
+
 def difficulty_proxy(text: str) -> float:
     """Cheap, dependency-free readability proxy for *stratification only* (never a
     label): a Flesch-Kincaid-flavoured blend of sentence length and word length."""
