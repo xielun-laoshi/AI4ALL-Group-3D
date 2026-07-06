@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import get_cosine_schedule_with_warmup
 
 from .config import Config
+from .data import pairing_group_ids
 from .evaluation import rmse, spearman
 from .external import difficulty_proxy
 from .model import DifficultyRegressor, apply_lora, build_tokenizer
@@ -48,24 +49,56 @@ class _Rows(Dataset):
             self.feat = (raw - mean) / max(std, 1e-6)
         else:
             self.feat = np.zeros(len(self.text), dtype="float32")
+        # pairing group: pair-corpus rows share their article's id (pairwise
+        # signal + batch co-location); all other rows are unique (never pair).
+        self.grp = pairing_group_ids(df)
         self.ids = df["id"].astype(str).tolist()
 
     def __len__(self) -> int:
         return len(self.text)
 
     def __getitem__(self, i: int):
-        return self.text[i], self.y[i], self.src[i], self.w[i], self.feat[i], self.ids[i]
+        return (self.text[i], self.y[i], self.src[i], self.w[i], self.feat[i],
+                self.grp[i], self.ids[i])
+
+
+class _GroupShuffleSampler(torch.utils.data.Sampler):
+    """Shuffle at pairing-group granularity: members of a pair-corpus article
+    stay adjacent, so they land in the same batch (in-batch pairwise loss needs
+    co-location -- under plain row shuffling a pair almost never shares a batch
+    and the loss silently never fires). Non-pair rows are singleton groups, so
+    for them this reduces to ordinary row shuffling. Reshuffles every epoch."""
+
+    def __init__(self, groups: np.ndarray, seed: int) -> None:
+        order = np.argsort(groups, kind="stable")
+        g_sorted = np.asarray(groups)[order]
+        boundaries = np.flatnonzero(np.diff(g_sorted)) + 1
+        self.blocks = np.split(order, boundaries)
+        self.n = len(groups)
+        self.seed = seed
+        self.epoch = 0
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        for b in torch.randperm(len(self.blocks), generator=g).tolist():
+            yield from self.blocks[b].tolist()
+
+    def __len__(self) -> int:
+        return self.n
 
 
 def _pairwise_loss(scores: torch.Tensor, targets: torch.Tensor,
-                   sources: torch.Tensor | None = None, margin: float = 0.0) -> torch.Tensor:
+                   groups: torch.Tensor | None = None, margin: float = 0.0) -> torch.Tensor:
     """Margin ranking loss over ordered in-batch pairs where the targets differ --
-    teaches correct *ordering*, which transfers across corpora.
+    teaches correct *ordering*.
 
-    Pairs are restricted to the SAME source when ``sources`` is given: percentile
-    targets from different corpora aren't on a comparable ruler (0.5 in CEFR is
-    not 0.5 in CLEAR), so cross-source pairs inject scale-mismatch noise -- the
-    run-2 ablation measured the unmasked head as net-negative for transfer."""
+    Pairs are restricted to the same ``groups`` id. The trainer passes PAIRING
+    groups (same source article): pair-corpus rows share their article's id, all
+    other rows are unique -- so the loss fires only where ordering carries
+    guaranteed construct signal. (Run-2 measured random cross-text pairs as
+    net-negative; the earlier same-corpus mask still allowed those.)"""
     n = scores.shape[0]
     if n < 2:
         return scores.new_zeros(())
@@ -73,8 +106,8 @@ def _pairwise_loss(scores: torch.Tensor, targets: torch.Tensor,
     ti, tj = targets.unsqueeze(0), targets.unsqueeze(1)
     sign = torch.sign(ti - tj)
     mask = sign != 0
-    if sources is not None:
-        mask = mask & (sources.unsqueeze(0) == sources.unsqueeze(1))
+    if groups is not None:
+        mask = mask & (groups.unsqueeze(0) == groups.unsqueeze(1))
     if mask.sum() == 0:
         return scores.new_zeros(())
     diff = (si - sj)
@@ -97,17 +130,22 @@ class Trainer:
 
     # --- internals --------------------------------------------------------- #
     def _collate(self, batch):
-        texts, ys, srcs, ws, feats, ids = zip(*batch)
+        texts, ys, srcs, ws, feats, grps, ids = zip(*batch)
         enc = self.tokenizer(list(texts), padding=True, truncation=True,
                              max_length=self.cfg.model.max_length, return_tensors="pt")
         return (enc, torch.tensor(ys), torch.tensor(srcs), torch.tensor(ws),
-                torch.tensor(feats), list(ids))
+                torch.tensor(feats), torch.tensor(grps), list(ids))
 
     def _loader(self, df, *, shuffle: bool, batch_size: int) -> DataLoader:
         ds = _Rows(df, self.target_col, self.source_map,
                    use_conf_weight=self.cfg.train.confidence_weighting,
                    proxy_stats=self.proxy_stats)
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
+        if shuffle:  # group-granular shuffle keeps pair members in one batch
+            sampler = _GroupShuffleSampler(ds.grp, self.cfg.train.seed)
+            return DataLoader(ds, batch_size=batch_size, sampler=sampler,
+                              collate_fn=self._collate, num_workers=0,
+                              pin_memory=(self.device == "cuda"))
+        return DataLoader(ds, batch_size=batch_size, shuffle=False,
                           collate_fn=self._collate, num_workers=0, pin_memory=(self.device == "cuda"))
 
     def _feats_arg(self, feats: torch.Tensor):
@@ -170,7 +208,8 @@ class Trainer:
         for epoch in range(tc.epochs):
             self.model.train()
             running = 0.0
-            for enc, y, src, w, feats, _ in loader:
+            running_pair = 0.0
+            for enc, y, src, w, feats, grp, _ in loader:
                 enc = {k: v.to(self.device) for k, v in enc.items()}
                 y, src, w = y.to(self.device), src.to(self.device), w.to(self.device)
                 opt.zero_grad()
@@ -178,14 +217,21 @@ class Trainer:
                     pred = self.model(enc["input_ids"], enc["attention_mask"], src,
                                       extra_feats=self._feats_arg(feats))
                     point = (w * (pred - y) ** 2).mean() * tc.pointwise_weight
-                    pair = _pairwise_loss(pred, y, src) * tc.pairwise_weight if self.cfg.model.use_pairwise_head else 0.0
+                    # pairwise masked to same PAIRING GROUP (same source article):
+                    # fires only where ordering carries guaranteed construct signal.
+                    pair = _pairwise_loss(pred, y, grp.to(self.device)) * tc.pairwise_weight \
+                        if self.cfg.model.use_pairwise_head else 0.0
                     loss = point + pair
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 opt.step()
                 sched.step()
                 running += float(loss) * len(y)
+                running_pair += float(pair) * len(y)
             msg = {"epoch": epoch + 1, "train_loss": running / len(train_df)}
+            if self.cfg.model.use_pairwise_head:
+                # visibility: ~0 here means pairs never co-occur (sampler broken)
+                msg["pair_loss"] = running_pair / len(train_df)
             if val_df is not None and len(val_df):
                 vp = self.predict(val_df)["pred"].to_numpy()
                 vy = pd.to_numeric(val_df[self.target_col], errors="coerce").to_numpy()
@@ -207,7 +253,7 @@ class Trainer:
         self.model.eval()
         loader = self._loader(df, shuffle=False, batch_size=batch_size or self.cfg.train.batch_size * 2)
         preds, ids = [], []
-        for enc, _y, src, _w, feats, batch_ids in loader:
+        for enc, _y, src, _w, feats, _g, batch_ids in loader:
             enc = {k: v.to(self.device) for k, v in enc.items()}
             with self._autocast():
                 out = self.model(enc["input_ids"], enc["attention_mask"], src.to(self.device),

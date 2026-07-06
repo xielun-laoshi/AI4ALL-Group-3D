@@ -42,6 +42,10 @@ log = get_logger("loco")
 VARIANTS: dict[str, list[str]] = {
     "gold":    [],                                  # multi-gold baseline
     "gold_ff": ["model.use_formula_feature=true"],  # + formula proxy in the head
+    # + pairwise head over pair-corpus articles (wiki-pairs construct test:
+    # include wikipair via --corpora; with the head OFF those rows are inert,
+    # so gold vs gold_pw on the same table isolates the pair supervision).
+    "gold_pw": ["model.use_pairwise_head=true"],
 }
 
 
@@ -52,7 +56,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--folds", nargs="+", default=["onestop", "cefr"],
                     help="each fold holds out this corpus and trains on the rest")
     ap.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44])
-    ap.add_argument("--variants", nargs="+", default=list(VARIANTS), choices=list(VARIANTS))
+    ap.add_argument("--variants", nargs="+", default=["gold", "gold_ff"], choices=list(VARIANTS))
+    ap.add_argument("--corpora", nargs="+", default=None,
+                    help="override the corpora in each fold's table, e.g. "
+                         "clear onestop cefr wikipair (wikipair adds pair supervision)")
     ap.add_argument("--hybrid-weight", type=float, default=0.5,
                     help="model weight in the zero-training rank-blend scored per variant")
     ap.add_argument("--max-rows-per-corpus", type=int, default=0,
@@ -67,8 +74,11 @@ def main(argv: list[str] | None = None) -> int:
         fold_dir.mkdir(parents=True, exist_ok=True)
         table_path = fold_dir / "corpus.csv"
         # per-fold table at its own path: no stale-table aliasing between folds
-        data_preprocessing.main(["--config", args.config, "--skip-download",
-                                 "--holdout-corpora", fold, "--out", str(table_path)])
+        dp_args = ["--config", args.config, "--skip-download",
+                   "--holdout-corpora", fold, "--out", str(table_path)]
+        if args.corpora:
+            dp_args += ["--corpora", *args.corpora]
+        data_preprocessing.main(dp_args)
         table = read_table(table_path)
         if args.max_rows_per_corpus:
             table = (table.groupby("corpus", group_keys=False)

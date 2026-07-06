@@ -208,6 +208,66 @@ def load_cefr(raw_path: str | Path) -> pd.DataFrame:
     return coerce(out)
 
 
+# Corpora whose labels are ordinal ONLY within one source article (pair
+# supervision). Their rows are excluded from the pointwise loss (mapping
+# confidence 0), never enter val, and feed training solely through the
+# pairwise head masked to same-article groups.
+PAIR_CORPORA = {"wikipair"}
+
+
+def load_wikipair(raw_path: str | Path) -> pd.DataFrame:
+    """Load title-joined simple<->en Wikipedia article pairs (CSV: title,
+    simple_text, en_text) into the unified schema. Each side is windowed to
+    excerpt size (<=2 lead chunks); a pair is kept only if BOTH sides yield a
+    chunk (a single-sided article carries no pair signal).
+
+    native_label: 0=simple, 1=en -- 'same content, two difficulty levels', the
+    within-article re-leveling construct OneStop needs and no gold corpus has."""
+    df = pd.read_csv(raw_path)
+    records: list[Record] = []
+    kept = 0
+    for pid, row in enumerate(df.itertuples(index=False)):
+        sides = []
+        for level, label in (("simple", 0.0), ("en", 1.0)):
+            raw = getattr(row, f"{level}_text", "")
+            text = "" if pd.isna(raw) else str(raw)
+            # a usable side needs a real excerpt: guard NaN cells (str(nan)='nan')
+            # and sub-excerpt fragments window_text passes through for 1-para docs
+            chunks = [c for c in window_text(text)[:2] if len(c.split()) >= 50]
+            if chunks:
+                sides.append((level, label, chunks))
+        if len(sides) < 2:
+            continue                      # need both sides for a usable pair
+        kept += 1
+        for level, label, chunks in sides:
+            for ci, chunk in enumerate(chunks):
+                records.append(Record(
+                    id=f"wikipair:{pid}:{level}:{ci}", text=chunk, corpus="wikipair",
+                    native_label=label, native_scale="pair_ordinal",
+                    format_type="prose", domain="encyclopedic", language="en",
+                    license="CC-BY-SA"))
+    if not records:
+        raise ValueError(f"no usable pairs parsed from {raw_path}")
+    out = records_to_frame(records)
+    log.info("loaded wikipair: %d chunks from %d pairs", len(out), kept)
+    return coerce(out)
+
+
+def pairing_group_ids(df: pd.DataFrame) -> np.ndarray:
+    """Integer pairing-group per row: rows of a PAIR corpus share their source
+    article's group (so the pairwise loss and the batch sampler can co-locate
+    them); every other row gets a unique id (never pairs -- matching the run-2
+    evidence that random cross-text pairs hurt)."""
+    gids = derive_group_id(df)
+    is_pair = df["corpus"].isin(PAIR_CORPORA).to_numpy()
+    codes, _ = pd.factorize(gids)
+    out = codes.astype("int64").copy()
+    base = int(out.max()) + 1 if len(out) else 0
+    idx = np.flatnonzero(~is_pair)
+    out[idx] = base + np.arange(len(idx))
+    return out
+
+
 def _stub_loader(name: str) -> Callable[[str | Path], pd.DataFrame]:
     def _loader(raw_path: str | Path) -> pd.DataFrame:
         raise NotImplementedError(
@@ -225,6 +285,7 @@ REGISTRY: dict[str, Callable[[str | Path], pd.DataFrame]] = {
     "clear": load_clear,
     "onestop": load_onestop,
     "cefr": load_cefr,
+    "wikipair": load_wikipair,
     "newsela": _stub_loader("newsela"),
     "weebit": _stub_loader("weebit"),
     "wiki_simple": _stub_loader("wiki_simple"),
@@ -309,7 +370,7 @@ def dedup_against(df: pd.DataFrame, reference: pd.DataFrame, *, key: str = "text
 # --------------------------------------------------------------------------- #
 # Guardrail: this axis only *merges* corpora; supervision/eval stay on the human
 # label. CLEAR's BT easiness is higher=EASIER, so its polarity is inverted.
-POLARITY = {"clear": False, "onestop": True, "cefr": True}   # higher native label == harder?
+POLARITY = {"clear": False, "onestop": True, "cefr": True, "wikipair": True}   # higher native label == harder?
 
 
 def percentile_within_corpus(df: pd.DataFrame, *, label_col: str = "native_label",
@@ -331,6 +392,10 @@ def harmonize(df: pd.DataFrame, *, method: str = "percentile",
         out["harmonized_difficulty"] = percentile_within_corpus(out, polarity=polarity)
         out["mapping_method"] = "percentile_within_corpus"
         out["mapping_confidence"] = np.where(out["harmonized_difficulty"].notna(), 1.0, np.nan)
+        # Pair corpora: the 0/1 label is ordinal only WITHIN one article, so the
+        # global percentile is not a trustworthy pointwise target -- zero the
+        # confidence (pointwise weight); signal flows via the pairwise head only.
+        out.loc[out["corpus"].isin(PAIR_CORPORA), "mapping_confidence"] = 0.0
     elif method in {"band_table", "isotonic"}:
         raise NotImplementedError(
             f"harmonization method '{method}' is a Phase-1 stub; implement once "
@@ -360,10 +425,12 @@ def assign_splits(df: pd.DataFrame, *, holdout_corpora: list[str] | None = None,
     split[out["corpus"].isin(holdout_corpora).to_numpy() & has_label] = "ood_corpus"
     split[out["format_type"].isin(holdout_formats).to_numpy() & has_label] = "ood_format"
 
-    train_idx = np.where(split == "train")[0]
-    n_val = int(len(train_idx) * val_fraction)
+    # Pair-corpus rows stay in train: their labels are within-article ordinal,
+    # so val pointwise metrics over them would be meaningless noise.
+    val_pool = np.where((split == "train") & ~out["corpus"].isin(PAIR_CORPORA).to_numpy())[0]
+    n_val = int(len(val_pool) * val_fraction)
     if n_val > 0:
-        split[rng.choice(train_idx, size=n_val, replace=False)] = "val"
+        split[rng.choice(val_pool, size=n_val, replace=False)] = "val"
 
     out["split"] = split
     log.info("split assignment: %s", out["split"].value_counts().to_dict())
