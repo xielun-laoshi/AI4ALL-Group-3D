@@ -212,6 +212,27 @@ def test_group_shuffle_sampler_colocates_pair_members():
         assert abs(pos[0] - pos[1]) == 1
 
 
+def test_decompose_pairs_averages_seeds_and_decomposes(tmp_path):
+    import decompose_pairs
+    # two seeds, pred monotone in level within each article (perfect re-leveling)
+    for seed, off in ((42, 0.0), (43, 0.02)):
+        rows = [{"id": f"onestop:{art}:{lvl}:0", "pred": lvl * 0.3 + off}
+                for art in ("A", "B") for lvl in (0, 1, 2)]
+        pd.DataFrame(rows).to_csv(tmp_path / f"preds_gold_pw_s{seed}.csv", index=False)
+    preds, n = decompose_pairs.averaged_preds(tmp_path, "gold_pw")
+    assert n == 2 and len(preds) == 6
+    lvl1 = float(preds.set_index("id").loc["onestop:A:1:0", "pred"])
+    assert abs(lvl1 - (0.30 + 0.32) / 2) < 1e-9            # seeds averaged
+
+    table = pd.DataFrame([
+        {"id": f"onestop:{art}:{lvl}:0", "corpus": "onestop",
+         "native_label": float(lvl), "harmonized_difficulty": lvl * 0.3}
+        for art in ("A", "B") for lvl in (0, 1, 2)])
+    out = decompose_pairs.decompose_variant(table, preds, "harmonized_difficulty")
+    assert out["n"] == 6
+    assert out["within_article_acc"] == 1.0                # monotone in level within article
+
+
 def test_rank_blend_ensemble_beats_both_singles():
     from analyze_transfer import rank_blend
     rng = np.random.default_rng(1)
